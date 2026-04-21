@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+# push-to-phone: send a URL or message as a tappable notification
+# to your phone via ntfy.sh.
+#
+# Usage:
+#   push-to-phone <url>                       # tappable notification, opens URL in default iOS browser (Brave)
+#   push-to-phone -t "Custom title" <url>
+#   push-to-phone -t "Title" -m "Body text" <url>
+#   echo "some message" | push-to-phone       # plain message from stdin
+#   push-to-phone -b < urls.txt               # batch: one URL per line
+#
+# Env overrides:
+#   NTFY_TOPIC    required (no default); your ntfy.sh topic name
+#   NTFY_SERVER   default: https://ntfy.sh
+#   NTFY_PRIORITY default: default  (min|low|default|high|urgent)
+
+set -euo pipefail
+
+TOPIC="${NTFY_TOPIC:-}"
+if [[ -z "$TOPIC" ]]; then
+  echo "error: NTFY_TOPIC is not set." >&2
+  echo "  Export it in your shell rc, e.g.  export NTFY_TOPIC=your-unguessable-topic" >&2
+  exit 2
+fi
+SERVER="${NTFY_SERVER:-https://ntfy.sh}"
+PRIORITY="${NTFY_PRIORITY:-default}"
+
+title=""
+message=""
+url=""
+batch=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -t|--title)    title="$2"; shift 2 ;;
+    -m|--message)  message="$2"; shift 2 ;;
+    -p|--priority) PRIORITY="$2"; shift 2 ;;
+    -b|--batch)    batch=1; shift ;;
+    -h|--help)
+      sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
+      exit 0 ;;
+    -*)
+      echo "unknown flag: $1" >&2; exit 2 ;;
+    *) url="$1"; shift ;;
+  esac
+done
+
+send_one() {
+  local u="$1" t="$2" m="$3"
+  local -a args=(-s -o /dev/null -w "%{http_code}"
+                 -H "Title: $t"
+                 -H "Priority: $PRIORITY")
+  if [[ -n "$u" ]]; then
+    args+=(-H "Click: $u")
+    args+=(-H "Actions: view, Open in Brave, $u, clear=true")
+  fi
+  args+=(-d "$m" "$SERVER/$TOPIC")
+  local status
+  status=$(curl "${args[@]}")
+  if [[ "$status" != "200" ]]; then
+    echo "ntfy error HTTP $status for: $u" >&2
+    return 1
+  fi
+}
+
+if (( batch )); then
+  n=0
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    # Line may be "URL" or "Title||URL"
+    if [[ "$line" == *"||"* ]]; then
+      t="${line%%||*}"
+      u="${line##*||}"
+    else
+      t="Link from Mac"
+      u="$line"
+    fi
+    send_one "$u" "$t" "$u"
+    n=$((n+1))
+    sleep 0.3
+  done
+  echo "Pushed $n item(s) to $TOPIC"
+  exit 0
+fi
+
+# Single-shot
+if [[ -z "$url" && -z "$message" ]]; then
+  message=$(cat)
+fi
+[[ -n "$url" && -z "$message" ]] && message="$url"
+if [[ -z "$title" ]]; then
+  if [[ -n "$url" ]]; then title="Link from Mac"
+  else                     title="Message from Mac"; fi
+fi
+
+send_one "$url" "$title" "$message"
+echo "Sent to $SERVER/$TOPIC"
