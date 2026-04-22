@@ -1,97 +1,328 @@
 #!/usr/bin/env bash
-# push-to-phone: send a URL or message as a tappable notification
-# to your phone via ntfy.sh.
+# push-to-phone: send a URL, message, file, or command-exit notification
+# from a shell to your phone via ntfy.sh (or any ntfy server).
 #
 # Usage:
-#   push-to-phone <url>                       # tappable notification, opens URL in default iOS browser (Brave)
-#   push-to-phone -t "Custom title" <url>
-#   push-to-phone -t "Title" -m "Body text" <url>
-#   echo "some message" | push-to-phone       # plain message from stdin
-#   push-to-phone -b < urls.txt               # batch: one URL per line
+#   push-to-phone <url>                           # tappable notification, opens URL
+#   push-to-phone -t "Title" -m "Body" <url>
+#   push-to-phone --attach ./plot.png -t "loss"   # upload a file
+#   push-to-phone --tag rocket,green_circle <url> # ntfy emoji tags
+#   push-to-phone --in 30m -m "check oven"        # scheduled delivery
+#   push-to-phone --at "tomorrow 9am" -m "standup"
+#   push-to-phone --markdown -m "**bold** body"
+#   push-to-phone --copy "secret-123" -m "OTP"    # tappable copy-to-clipboard
+#   echo "msg" | push-to-phone                    # message from stdin
+#   push-to-phone -b < urls.txt                   # batch: one URL (or "Title||URL") per line
+#   push-to-phone wrap -- python train.py         # run cmd, notify on exit (auto ✅/❌)
+#   push-to-phone doctor                          # sanity-check setup
 #
-# Env overrides:
-#   NTFY_TOPIC    required (no default); your ntfy.sh topic name
-#   NTFY_SERVER   default: https://ntfy.sh
-#   NTFY_PRIORITY default: default  (min|low|default|high|urgent)
+# Config precedence (later overrides earlier):
+#   1. Built-in defaults
+#   2. ~/.config/push-to-phone/config  (sourced as bash)
+#   3. Environment variables
+#   4. Command-line flags
+#
+# Env / config keys:
+#   NTFY_TOPIC     required; your ntfy.sh topic (treat as a password)
+#   NTFY_SERVER    default https://ntfy.sh
+#   NTFY_TOKEN     optional bearer token (for auth-protected servers)
+#   NTFY_PRIORITY  default "default"  (min|low|default|high|urgent, or 1..5)
 
-set -euo pipefail
+set -eo pipefail
+# NOTE: `set -u` is deliberately omitted because macOS ships bash 3.2, and
+# expanding an empty array under `set -u` on bash < 4.4 raises "unbound variable".
+
+VERSION="0.2.0"
+
+# ---------- config loader ----------
+CONFIG_FILE="${PUSH_TO_PHONE_CONFIG:-$HOME/.config/push-to-phone/config}"
+if [[ -f "$CONFIG_FILE" ]]; then
+  # shellcheck disable=SC1090
+  source "$CONFIG_FILE"
+fi
 
 TOPIC="${NTFY_TOPIC:-}"
-if [[ -z "$TOPIC" ]]; then
-  echo "error: NTFY_TOPIC is not set." >&2
-  echo "  Export it in your shell rc, e.g.  export NTFY_TOPIC=your-unguessable-topic" >&2
-  exit 2
-fi
 SERVER="${NTFY_SERVER:-https://ntfy.sh}"
+TOKEN="${NTFY_TOKEN:-}"
 PRIORITY="${NTFY_PRIORITY:-default}"
 
+# ---------- helpers ----------
+die()  { echo "push-to-phone: $*" >&2; exit 2; }
+warn() { echo "push-to-phone: $*" >&2; }
+need_topic() {
+  if [[ -z "$TOPIC" ]]; then
+    cat >&2 <<EOF
+push-to-phone: NTFY_TOPIC is not set.
+Set it in ~/.config/push-to-phone/config, e.g.:
+    NTFY_TOPIC=your-unguessable-topic
+or export it:
+    export NTFY_TOPIC=your-unguessable-topic
+EOF
+    exit 3
+  fi
+}
+
+fmt_duration() {
+  # seconds -> "1h 23m 4s" or "45s"
+  local s=$1 h m
+  h=$(( s / 3600 )); s=$(( s % 3600 ))
+  m=$(( s / 60 ));   s=$(( s % 60 ))
+  if (( h > 0 )); then printf "%dh %dm %ds" "$h" "$m" "$s"
+  elif (( m > 0 )); then printf "%dm %ds" "$m" "$s"
+  else                  printf "%ds" "$s"; fi
+}
+
+usage() {
+  sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'
+  exit 0
+}
+
+# ---------- send ----------
+# send_one  url  title  message  [extra-header-pairs...]
+send_one() {
+  local url="$1" title="$2" message="$3"; shift 3
+  need_topic
+
+  local -a args=(-sS -o /tmp/push-to-phone.last.$$ -w "%{http_code}")
+  args+=(-H "Title: $title" -H "Priority: $PRIORITY")
+
+  if [[ -n "$url" ]]; then
+    args+=(-H "Click: $url")
+    args+=(-H "Actions: view, Open in Browser, $url, clear=true")
+  fi
+  [[ -n "$TOKEN" ]] && args+=(-H "Authorization: Bearer $TOKEN")
+  # Append any extra headers passed by caller (Tags, Markdown, At, Actions, Attach, Filename, ...)
+  while [[ $# -gt 0 ]]; do args+=(-H "$1"); shift; done
+
+  if (( DRY_RUN )); then
+    printf 'DRY-RUN: would POST to %s/%s\n  title=%q\n  message=%q\n  url=%q\n' \
+      "$SERVER" "$TOPIC" "$title" "$message" "$url"
+    for a in "${args[@]}"; do [[ "$a" == "-H" || "$a" == -* ]] && continue; echo "  header: $a"; done
+    return 0
+  fi
+
+  args+=(-d "$message" "$SERVER/$TOPIC")
+  local status
+  status=$(curl "${args[@]}" || echo "000")
+  local body; body=$(cat /tmp/push-to-phone.last.$$ 2>/dev/null || true)
+  rm -f /tmp/push-to-phone.last.$$ 2>/dev/null || true
+
+  if [[ "$status" != "200" ]]; then
+    warn "ntfy error HTTP $status${body:+: }$body"
+    return 1
+  fi
+  (( VERBOSE )) && echo "Sent to $SERVER/$TOPIC"
+  return 0
+}
+
+# send_file  path  title  message  [extra-header-pairs...]
+# Uploads a local file via PUT (ntfy's attachment endpoint).
+send_file() {
+  local path="$1" title="$2" message="$3"; shift 3
+  need_topic
+  [[ -f "$path" ]] || die "file not found: $path"
+
+  local filename; filename="$(basename "$path")"
+  local -a args=(-sS -o /tmp/push-to-phone.last.$$ -w "%{http_code}"
+                 -T "$path"
+                 -H "Filename: $filename"
+                 -H "Title: $title"
+                 -H "Priority: $PRIORITY"
+                 -H "Message: $message")
+  [[ -n "$TOKEN" ]] && args+=(-H "Authorization: Bearer $TOKEN")
+  while [[ $# -gt 0 ]]; do args+=(-H "$1"); shift; done
+
+  if (( DRY_RUN )); then
+    echo "DRY-RUN: would PUT $path to $SERVER/$TOPIC  (filename=$filename)"
+    return 0
+  fi
+
+  local status; status=$(curl "${args[@]}" "$SERVER/$TOPIC" || echo "000")
+  rm -f /tmp/push-to-phone.last.$$ 2>/dev/null || true
+  if [[ "$status" != "200" ]]; then
+    warn "attachment upload failed: HTTP $status"
+    return 1
+  fi
+  (( VERBOSE )) && echo "Uploaded $filename to $SERVER/$TOPIC"
+  return 0
+}
+
+# ---------- wrap mode ----------
+wrap_cmd() {
+  local title="" tag_on_success="white_check_mark" tag_on_fail="x"
+  local tail_lines=10
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -t|--title)         title="$2"; shift 2 ;;
+      --tail)             tail_lines="$2"; shift 2 ;;
+      --success-tag)      tag_on_success="$2"; shift 2 ;;
+      --fail-tag)         tag_on_fail="$2"; shift 2 ;;
+      --)                 shift; break ;;
+      -h|--help)
+        cat <<'EOF'
+push-to-phone wrap: run a command, notify on completion.
+
+Usage:
+  push-to-phone wrap [options] -- <command> [args...]
+
+Options:
+  -t, --title TEXT       Notification title (default: the command)
+  --tail N               If command fails, include last N lines of stderr (default 10)
+  --success-tag TAG      ntfy tag on success (default: white_check_mark)
+  --fail-tag TAG         ntfy tag on failure (default: x)
+
+Example:
+  push-to-phone wrap -t "train resnet50" -- python train.py --epochs 100
+EOF
+        exit 0 ;;
+      *) die "wrap: unknown flag $1 (use -- before the command)" ;;
+    esac
+  done
+  [[ $# -gt 0 ]] || die "wrap: no command given"
+
+  need_topic
+  local cmd_display; cmd_display="$*"
+  [[ -z "$title" ]] && title="$cmd_display"
+
+  local tmp_err; tmp_err=$(mktemp -t push-to-phone-stderr.XXXXXX)
+  local start=$SECONDS
+  local rc=0
+  # Run the command, tee stderr to tmp for later inclusion
+  ( "$@" 2> >(tee "$tmp_err" >&2) ) || rc=$?
+  local dur=$(( SECONDS - start ))
+  local durfmt; durfmt=$(fmt_duration "$dur")
+
+  if (( rc == 0 )); then
+    local sub="done in $durfmt"
+    send_one "" "✅ $title" "$sub" "Tags: $tag_on_success"
+  else
+    local errtail=""
+    if [[ -s "$tmp_err" ]]; then
+      errtail=$'\n\n--- last stderr ---\n'
+      errtail+=$(tail -n "$tail_lines" "$tmp_err")
+    fi
+    send_one "" "❌ $title" "failed (exit $rc) in $durfmt${errtail}" \
+      "Tags: $tag_on_fail" "Priority: high"
+  fi
+  rm -f "$tmp_err"
+  return $rc
+}
+
+# ---------- doctor ----------
+doctor_cmd() {
+  echo "push-to-phone v$VERSION"
+  echo "  config file:   $CONFIG_FILE  $( [[ -f "$CONFIG_FILE" ]] && echo "(present)" || echo "(missing)" )"
+  echo "  server:        $SERVER"
+  echo "  topic:         ${TOPIC:-<unset>}"
+  echo "  token:         $( [[ -n "$TOKEN" ]] && echo "<set>" || echo "<unset>" )"
+  echo "  priority:      $PRIORITY"
+  echo "  curl:          $(command -v curl || echo MISSING)"
+
+  if [[ -z "$TOPIC" ]]; then
+    echo
+    echo "NTFY_TOPIC is not set. Create $CONFIG_FILE with:"
+    echo "    NTFY_TOPIC=your-unguessable-topic"
+    return 3
+  fi
+
+  echo
+  echo "Sending a test notification..."
+  if send_one "" "push-to-phone doctor" "If you see this, your setup works." "Tags: stethoscope,white_check_mark"; then
+    echo "OK. Check your phone."
+  else
+    echo "FAIL. See error above."
+    return 4
+  fi
+}
+
+# ---------- arg parsing (main mode) ----------
 title=""
 message=""
 url=""
+attach=""
+tags=""
+at=""
+markdown=0
+copy_value=""
 batch=0
+DRY_RUN=0
+VERBOSE=0
+
+# Subcommands
+case "${1:-}" in
+  wrap)    shift; wrap_cmd "$@"; exit $? ;;
+  doctor|test) shift; doctor_cmd "$@"; exit $? ;;
+  help|-h|--help) usage ;;
+  version|--version|-V) echo "push-to-phone $VERSION"; exit 0 ;;
+esac
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -t|--title)    title="$2"; shift 2 ;;
     -m|--message)  message="$2"; shift 2 ;;
     -p|--priority) PRIORITY="$2"; shift 2 ;;
+    --tag|--tags)  tags="$2"; shift 2 ;;
+    --attach|-a)   attach="$2"; shift 2 ;;
+    --at)          at="$2"; shift 2 ;;
+    --in)          at="$2"; shift 2 ;;       # ntfy accepts durations in `At` too
+    -M|--markdown) markdown=1; shift ;;
+    --copy)        copy_value="$2"; shift 2 ;;
     -b|--batch)    batch=1; shift ;;
-    -h|--help)
-      sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
-      exit 0 ;;
-    -*)
-      echo "unknown flag: $1" >&2; exit 2 ;;
-    *) url="$1"; shift ;;
+    -n|--dry-run)  DRY_RUN=1; shift ;;
+    -v|--verbose)  VERBOSE=1; shift ;;
+    --token)       TOKEN="$2"; shift 2 ;;
+    --server)      SERVER="$2"; shift 2 ;;
+    --topic)       TOPIC="$2"; shift 2 ;;
+    -h|--help)     usage ;;
+    --)            shift; url="${1:-}"; shift || true ;;
+    -*)            die "unknown flag: $1" ;;
+    *)             url="$1"; shift ;;
   esac
 done
 
-send_one() {
-  local u="$1" t="$2" m="$3"
-  local -a args=(-s -o /dev/null -w "%{http_code}"
-                 -H "Title: $t"
-                 -H "Priority: $PRIORITY")
-  if [[ -n "$u" ]]; then
-    args+=(-H "Click: $u")
-    args+=(-H "Actions: view, Open in Brave, $u, clear=true")
-  fi
-  args+=(-d "$m" "$SERVER/$TOPIC")
-  local status
-  status=$(curl "${args[@]}")
-  if [[ "$status" != "200" ]]; then
-    echo "ntfy error HTTP $status for: $u" >&2
-    return 1
-  fi
-}
+# Collect optional headers
+extra_headers=()
+[[ -n "$tags"       ]] && extra_headers+=("Tags: $tags")
+[[ -n "$at"         ]] && extra_headers+=("At: $at")
+(( markdown ))        && extra_headers+=("Markdown: yes")
+if [[ -n "$copy_value" ]]; then
+  extra_headers+=("Actions: copy, Copy, $copy_value")
+fi
 
+# Batch mode
 if (( batch )); then
+  need_topic
   n=0
   while IFS= read -r line; do
     [[ -z "$line" ]] && continue
-    # Line may be "URL" or "Title||URL"
-    if [[ "$line" == *"||"* ]]; then
-      t="${line%%||*}"
-      u="${line##*||}"
-    else
-      t="Link from Mac"
-      u="$line"
-    fi
-    send_one "$u" "$t" "$u"
+    if [[ "$line" == *"||"* ]]; then t="${line%%||*}"; u="${line##*||}"
+    else                             t="Link from Mac"; u="$line"; fi
+    send_one "$u" "$t" "$u" "${extra_headers[@]}"
     n=$((n+1))
     sleep 0.3
   done
-  echo "Pushed $n item(s) to $TOPIC"
+  echo "Pushed $n item(s) to $SERVER/$TOPIC"
   exit 0
 fi
 
-# Single-shot
+# File attachment
+if [[ -n "$attach" ]]; then
+  [[ -z "$title" ]]   && title="$(basename "$attach")"
+  [[ -z "$message" ]] && message="${url:-}"
+  send_file "$attach" "$title" "$message" "${extra_headers[@]}"
+  exit $?
+fi
+
+# Single message
 if [[ -z "$url" && -z "$message" ]]; then
-  message=$(cat)
+  # Read from stdin if available
+  if [[ ! -t 0 ]]; then message=$(cat); fi
 fi
 [[ -n "$url" && -z "$message" ]] && message="$url"
 if [[ -z "$title" ]]; then
   if [[ -n "$url" ]]; then title="Link from Mac"
   else                     title="Message from Mac"; fi
 fi
+[[ -z "$message" && -z "$url" ]] && die "nothing to send (no url, message, stdin, or --attach)"
 
-send_one "$url" "$title" "$message"
-echo "Sent to $SERVER/$TOPIC"
+send_one "$url" "$title" "$message" "${extra_headers[@]}"

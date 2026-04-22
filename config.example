@@ -1,0 +1,21 @@
+# push-to-phone configuration
+# Copy this to ~/.config/push-to-phone/config and fill in your topic.
+#
+#   mkdir -p ~/.config/push-to-phone
+#   cp config.example ~/.config/push-to-phone/config
+#   chmod 600 ~/.config/push-to-phone/config
+#
+# This file is sourced as bash, so quote values with spaces.
+
+# Required. Treat this like a password. Generate a random one:
+#   openssl rand -hex 16
+NTFY_TOPIC="your-unguessable-topic"
+
+# Optional. Defaults to https://ntfy.sh (the free public relay).
+# NTFY_SERVER="https://ntfy.example.com"
+
+# Optional. Bearer token for auth-protected servers.
+# NTFY_TOKEN="tk_xxxxxxxxxxxxxxxxxxxxxxxx"
+
+# Optional. Default priority: min | low | default | high | urgent (or 1..5).
+# NTFY_PRIORITY="default"
