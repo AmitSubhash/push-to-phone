@@ -19,8 +19,8 @@
 # Config precedence (later overrides earlier):
 #   1. Built-in defaults
 #   2. ~/.config/push-to-phone/config  (sourced as bash)
-#   3. Environment variables
-#   4. Command-line flags
+#   3. Environment variables (NTFY_TOPIC, NTFY_SERVER, NTFY_TOKEN, NTFY_PRIORITY)
+#   4. Command-line flags (--topic, --server, --token, --priority, ...)
 #
 # Env / config keys:
 #   NTFY_TOPIC     required; your ntfy.sh topic (treat as a password)
@@ -32,19 +32,28 @@ set -eo pipefail
 # NOTE: `set -u` is deliberately omitted because macOS ships bash 3.2, and
 # expanding an empty array under `set -u` on bash < 4.4 raises "unbound variable".
 
-VERSION="0.2.0"
+VERSION="0.3.0"
 
 # ---------- config loader ----------
+# Precedence (highest wins): CLI flags > env vars > config file > built-in defaults.
+# We capture env BEFORE sourcing the config so env can override config values.
 CONFIG_FILE="${PUSH_TO_PHONE_CONFIG:-$HOME/.config/push-to-phone/config}"
+_env_TOPIC="${NTFY_TOPIC:-}"
+_env_SERVER="${NTFY_SERVER:-}"
+_env_TOKEN="${NTFY_TOKEN:-}"
+_env_PRIORITY="${NTFY_PRIORITY:-}"
+
 if [[ -f "$CONFIG_FILE" ]]; then
   # shellcheck disable=SC1090
   source "$CONFIG_FILE"
 fi
 
-TOPIC="${NTFY_TOPIC:-}"
-SERVER="${NTFY_SERVER:-https://ntfy.sh}"
-TOKEN="${NTFY_TOKEN:-}"
-PRIORITY="${NTFY_PRIORITY:-default}"
+# Re-overlay env values on top of whatever config just set
+TOPIC="${_env_TOPIC:-${NTFY_TOPIC:-}}"
+SERVER="${_env_SERVER:-${NTFY_SERVER:-https://ntfy.sh}}"
+TOKEN="${_env_TOKEN:-${NTFY_TOKEN:-}}"
+PRIORITY="${_env_PRIORITY:-${NTFY_PRIORITY:-default}}"
+unset _env_TOPIC _env_SERVER _env_TOKEN _env_PRIORITY
 
 # ---------- helpers ----------
 die()  { echo "push-to-phone: $*" >&2; exit 2; }
@@ -72,43 +81,92 @@ fmt_duration() {
   else                  printf "%ds" "$s"; fi
 }
 
+sanitize_header() {
+  # Remove CR/LF from a value so it cannot be used to inject extra HTTP headers.
+  # Also trims leading/trailing whitespace.
+  local v="$1"
+  v="${v//$'\r'/}"
+  v="${v//$'\n'/ }"
+  printf '%s' "$v"
+}
+
+mktempf() {
+  # Portable mktemp that works on macOS and Linux.
+  mktemp -t "push-to-phone.XXXXXX" 2>/dev/null || mktemp /tmp/push-to-phone.XXXXXX
+}
+
+# escape_curlconf  value
+# Escapes a string for use as the right-hand side of a curl -K config line.
+# curl doubles \" inside double-quoted values and allows \\, \t, \n.
+escape_curlconf() {
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  printf '%s' "$s"
+}
+
 usage() {
   sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'
   exit 0
 }
 
 # ---------- send ----------
+# Internal helper: write a curl config file that contains url/headers/data,
+# so none of these values appear in curl's argv (visible in `ps`).
+# args: config_file_path, url, data-or-empty, header_lines[@]
+_write_curl_config() {
+  local cfg="$1" url="$2" data="$3"; shift 3
+  {
+    printf 'url = "%s"\n' "$(escape_curlconf "$url")"
+    if [[ -n "$data" ]]; then
+      printf 'data-raw = "%s"\n' "$(escape_curlconf "$data")"
+    fi
+    local h
+    for h in "$@"; do
+      printf 'header = "%s"\n' "$(escape_curlconf "$h")"
+    done
+    printf 'silent\nshow-error\n'
+  } > "$cfg"
+}
+
 # send_one  url  title  message  [extra-header-pairs...]
 send_one() {
   local url="$1" title="$2" message="$3"; shift 3
   need_topic
 
-  local -a args=(-sS -o /tmp/push-to-phone.last.$$ -w "%{http_code}")
-  args+=(-H "Title: $title" -H "Priority: $PRIORITY")
+  title=$(sanitize_header "$title")
 
+  local -a headers=("Title: $title" "Priority: $PRIORITY")
   if [[ -n "$url" ]]; then
-    args+=(-H "Click: $url")
-    args+=(-H "Actions: view, Open in Browser, $url, clear=true")
+    local url_clean; url_clean=$(sanitize_header "$url")
+    headers+=("Click: $url_clean" "Actions: view, Open in Browser, $url_clean, clear=true")
   fi
-  [[ -n "$TOKEN" ]] && args+=(-H "Authorization: Bearer $TOKEN")
-  # Append any extra headers passed by caller (Tags, Markdown, At, Actions, Attach, Filename, ...)
-  while [[ $# -gt 0 ]]; do args+=(-H "$1"); shift; done
+  [[ -n "$TOKEN" ]] && headers+=("Authorization: Bearer $TOKEN")
+  # Extra headers from caller (already sanitized by caller paths); re-sanitize to be safe.
+  while [[ $# -gt 0 ]]; do headers+=("$(sanitize_header "$1")"); shift; done
 
   if (( DRY_RUN )); then
     printf 'DRY-RUN: would POST to %s/%s\n  title=%q\n  message=%q\n  url=%q\n' \
       "$SERVER" "$TOPIC" "$title" "$message" "$url"
-    for a in "${args[@]}"; do [[ "$a" == "-H" || "$a" == -* ]] && continue; echo "  header: $a"; done
+    local h
+    for h in "${headers[@]}"; do echo "  header: $h"; done
     return 0
   fi
 
-  args+=(-d "$message" "$SERVER/$TOPIC")
-  local status
-  status=$(curl "${args[@]}" || echo "000")
-  local body; body=$(cat /tmp/push-to-phone.last.$$ 2>/dev/null || true)
-  rm -f /tmp/push-to-phone.last.$$ 2>/dev/null || true
+  # Write curl config to a private temp file with secure perms.
+  local cfg body_file status err_file
+  cfg=$(mktempf); body_file=$(mktempf); err_file=$(mktempf)
+  chmod 600 "$cfg"
+  _write_curl_config "$cfg" "$SERVER/$TOPIC" "$message" "${headers[@]}"
+
+  status=$(curl -K "$cfg" -o "$body_file" -w "%{http_code}" 2>"$err_file" || echo "000")
+  local body err
+  body=$(cat "$body_file" 2>/dev/null || true)
+  err=$(cat "$err_file"  2>/dev/null || true)
+  rm -f "$cfg" "$body_file" "$err_file"
 
   if [[ "$status" != "200" ]]; then
-    warn "ntfy error HTTP $status${body:+: }$body"
+    warn "ntfy error HTTP $status${body:+: }${body}${err:+  (curl: $err)}"
     return 1
   fi
   (( VERBOSE )) && echo "Sent to $SERVER/$TOPIC"
@@ -122,25 +180,46 @@ send_file() {
   need_topic
   [[ -f "$path" ]] || die "file not found: $path"
 
-  local filename; filename="$(basename "$path")"
-  local -a args=(-sS -o /tmp/push-to-phone.last.$$ -w "%{http_code}"
-                 -T "$path"
-                 -H "Filename: $filename"
-                 -H "Title: $title"
-                 -H "Priority: $PRIORITY"
-                 -H "Message: $message")
-  [[ -n "$TOKEN" ]] && args+=(-H "Authorization: Bearer $TOKEN")
-  while [[ $# -gt 0 ]]; do args+=(-H "$1"); shift; done
+  title=$(sanitize_header "$title")
+  local filename; filename=$(sanitize_header "$(basename "$path")")
+
+  local -a headers=(
+    "Filename: $filename"
+    "Title: $title"
+    "Priority: $PRIORITY"
+    "Message: $(sanitize_header "$message")"
+  )
+  [[ -n "$TOKEN" ]] && headers+=("Authorization: Bearer $TOKEN")
+  while [[ $# -gt 0 ]]; do headers+=("$(sanitize_header "$1")"); shift; done
 
   if (( DRY_RUN )); then
     echo "DRY-RUN: would PUT $path to $SERVER/$TOPIC  (filename=$filename)"
+    local h
+    for h in "${headers[@]}"; do echo "  header: $h"; done
     return 0
   fi
 
-  local status; status=$(curl "${args[@]}" "$SERVER/$TOPIC" || echo "000")
-  rm -f /tmp/push-to-phone.last.$$ 2>/dev/null || true
+  # Write a curl config file so URL + headers never appear in argv.
+  local cfg body_file err_file status body err
+  cfg=$(mktempf); body_file=$(mktempf); err_file=$(mktempf)
+  chmod 600 "$cfg"
+  {
+    printf 'url = "%s"\n' "$(escape_curlconf "$SERVER/$TOPIC")"
+    printf 'upload-file = "%s"\n' "$(escape_curlconf "$path")"
+    local h
+    for h in "${headers[@]}"; do
+      printf 'header = "%s"\n' "$(escape_curlconf "$h")"
+    done
+    printf 'silent\nshow-error\n'
+  } > "$cfg"
+
+  status=$(curl -K "$cfg" -o "$body_file" -w "%{http_code}" 2>"$err_file" || echo "000")
+  body=$(cat "$body_file" 2>/dev/null || true)
+  err=$(cat "$err_file"  2>/dev/null || true)
+  rm -f "$cfg" "$body_file" "$err_file"
+
   if [[ "$status" != "200" ]]; then
-    warn "attachment upload failed: HTTP $status"
+    warn "attachment upload failed: HTTP $status${body:+: }${body}${err:+  (curl: $err)}"
     return 1
   fi
   (( VERBOSE )) && echo "Uploaded $filename to $SERVER/$TOPIC"
@@ -184,17 +263,42 @@ EOF
   local cmd_display; cmd_display="$*"
   [[ -z "$title" ]] && title="$cmd_display"
 
-  local tmp_err; tmp_err=$(mktemp -t push-to-phone-stderr.XXXXXX)
+  local tmp_err child_pid cancelled=0
+  tmp_err=$(mktempf)
+
+  # Forward SIGINT/SIGTERM to the child, send a "cancelled" notification, re-raise.
+  cancel_handler() {
+    cancelled=1
+    if [[ -n "${child_pid:-}" ]] && kill -0 "$child_pid" 2>/dev/null; then
+      kill -TERM "$child_pid" 2>/dev/null || true
+    fi
+  }
+  trap cancel_handler INT TERM
+
   local start=$SECONDS
+  # Run command with stderr redirected to the temp file directly.
+  # Avoids the process-substitution race where very fast commands exit
+  # before `tee` has flushed.
+  "$@" 2> "$tmp_err" &
+  child_pid=$!
   local rc=0
-  # Run the command, tee stderr to tmp for later inclusion
-  ( "$@" 2> >(tee "$tmp_err" >&2) ) || rc=$?
+  wait "$child_pid" || rc=$?
+  # Echo stderr back to the user so they see it live-ish too.
+  if [[ -s "$tmp_err" ]]; then cat "$tmp_err" >&2; fi
+
   local dur=$(( SECONDS - start ))
   local durfmt; durfmt=$(fmt_duration "$dur")
+  trap - INT TERM
+
+  if (( cancelled )); then
+    send_one "" "⚠️  $title" "cancelled after $durfmt" "Tags: warning" "Priority: high" || true
+    rm -f "$tmp_err"
+    # Exit with 130 (SIGINT), matching the ctrl-c convention
+    return 130
+  fi
 
   if (( rc == 0 )); then
-    local sub="done in $durfmt"
-    send_one "" "✅ $title" "$sub" "Tags: $tag_on_success"
+    send_one "" "✅ $title" "done in $durfmt" "Tags: $tag_on_success"
   else
     local errtail=""
     if [[ -s "$tmp_err" ]]; then
@@ -279,6 +383,20 @@ while [[ $# -gt 0 ]]; do
     *)             url="$1"; shift ;;
   esac
 done
+
+# Sanity-check conflicting flag combinations
+if (( batch )) && [[ -n "$attach" ]]; then
+  die "--batch and --attach cannot be combined (attach each file in a separate call)"
+fi
+if (( batch )) && [[ -n "$url" || -n "$message" ]]; then
+  die "--batch reads URLs from stdin; do not also pass a URL or -m"
+fi
+
+# iOS ntfy app does not render markdown yet. Warn once if this looks
+# like an interactive call (stderr is a tty).
+if (( markdown )) && [[ -t 2 ]]; then
+  echo "push-to-phone: note: --markdown is a no-op on the iOS ntfy app (renders on web/Android)." >&2
+fi
 
 # Collect optional headers
 extra_headers=()

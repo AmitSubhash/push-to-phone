@@ -48,7 +48,7 @@ On your phone:
 | `-a, --attach FILE`      | Upload a local file (plot, log tail, screenshot) as attachment|
 | `--at TIME`              | Scheduled delivery: `"tomorrow 9am"`, `"in 30min"`, Unix ts   |
 | `--in DURATION`          | Shorthand: `30m`, `1h`, `2h`                                  |
-| `-M, --markdown`         | Render body as markdown on the phone                          |
+| `-M, --markdown`         | Render body as markdown (web + Android; iOS app ignores this) |
 | `--copy VALUE`           | Adds a tappable copy-to-clipboard action (great for OTPs)     |
 | `-b, --batch`            | Batch mode: one URL (or `Title||URL`) per line on stdin       |
 | `-n, --dry-run`          | Print what would be sent, do not POST                         |
@@ -132,6 +132,12 @@ bash tests/smoke.sh        # 11 dry-run + exit-code smoke tests, no network
 ntfy.sh is a public relay. Anyone who knows your topic name can push to your phone. Treat the topic like a password: make it long and unguessable (`openssl rand -hex 16`). For stricter setups, self-host ntfy and set `NTFY_SERVER` + `NTFY_TOKEN`.
 
 Your config file at `~/.config/push-to-phone/config` holds the topic; `chmod 600` it.
+
+Under the hood, push-to-phone passes the URL, data, and headers to `curl` via a short-lived `chmod 600` config file on stdin instead of argv. That keeps your topic, token, and message body out of the `ps` output. (Prior versions did put them on argv; upgrade to v0.3.0+ to close this.)
+
+## Known limitations
+
+- **iOS ntfy app does not render markdown** as of 2026-04. Messages sent with `--markdown` arrive with `**asterisks**` still visible on iOS. They render correctly on Android and on the ntfy.sh web viewer. push-to-phone prints a stderr warning when `--markdown` is used interactively.
 
 ## License
 

@@ -74,6 +74,48 @@ out=$("$BIN" wrap -- bash -c 'exit 7' 2>&1); rc=$?
 set -e
 (( rc == 7 )) && pass "wrap: exit 7 propagates" || fail "wrap: exit 7 propagates" "rc=$rc"
 
+echo "12) --batch + --attach is rejected"
+set +e
+out=$("$BIN" --batch --attach /tmp/nope 2>&1); rc=$?
+set -e
+[[ "$rc" -eq 2 && "$out" == *"cannot be combined"* ]] \
+  && pass "batch+attach conflict rejected" \
+  || fail "batch+attach conflict rejected" "rc=$rc out=$out"
+
+echo "13) Newline in title is sanitized (no CR/LF in dry-run headers)"
+out=$("$BIN" --dry-run -t $'Evil\r\nInjected: header' https://example.com)
+# The dry-run prints header lines; they should NOT contain CR or a stray 'Injected:' as a separate header
+if grep -q $'\r' <<<"$out"; then fail "newline sanitize" "CR leaked through"
+elif grep -qE '^  header: Injected:' <<<"$out"; then fail "newline sanitize" "LF split into extra header"
+else pass "CRLF stripped from title"
+fi
+
+echo "14) Topic does not appear in curl argv (no argv leak on send)"
+# With the refactor, curl runs as:  curl -K <config> -o <out> -w <fmt>
+# Topic lives inside the config file, not on argv. We spy by wrapping curl.
+spydir=$(mktemp -d -t spy.XXXXXX)
+cat > "$spydir/curl" <<'SPY'
+#!/usr/bin/env bash
+# Record our argv so the test can inspect it
+printf '%s\n' "$@" > "$SPY_ARGV_OUT"
+# Succeed with a fake 200 response
+: > "${2:-/dev/null}"   # -o <file>, keep output empty
+echo "200"
+SPY
+chmod +x "$spydir/curl"
+export NTFY_TOPIC="leak-canary-abc123"
+export SPY_ARGV_OUT="$spydir/argv.txt"
+PATH="$spydir:$PATH" "$BIN" -t "t" -m "msg" https://example.com >/dev/null || true
+argv=$(cat "$SPY_ARGV_OUT" 2>/dev/null || echo "")
+if grep -q "leak-canary-abc123" <<<"$argv"; then
+  fail "topic leak via argv" "argv: $argv"
+else
+  pass "topic not in argv"
+fi
+rm -rf "$spydir"
+unset SPY_ARGV_OUT
+export NTFY_TOPIC="test-topic"
+
 echo
 if (( fail == 0 )); then
   echo "ALL SMOKE TESTS PASSED"
