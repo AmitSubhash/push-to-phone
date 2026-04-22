@@ -34,7 +34,7 @@ push-to-phone doctor                     # sanity-check everything
 On your phone:
 1. Install the [ntfy iOS](https://apps.apple.com/us/app/ntfy/id1625396347) or [Android](https://play.google.com/store/apps/details?id=io.heckel.ntfy) app.
 2. Subscribe to the same topic name you set in your config.
-3. (Optional) On iOS: `Settings → Apps → Default Browser App → Brave` so tapped URLs open in Brave.
+3. (Optional) On iOS: `Settings -> Apps -> Default Browser App -> Brave` so tapped URLs open in Brave.
 
 ## Features
 
@@ -56,7 +56,7 @@ On your phone:
 | `--token TOKEN`          | Bearer auth (for auth-protected ntfy servers)                 |
 | `--server URL`           | Override ntfy server                                          |
 | `--topic NAME`           | Override topic                                                |
-| `wrap -- <cmd>`          | Run command, notify on exit with ✅/❌, duration, stderr tail |
+| `wrap -- <cmd>`          | Run command, notify on exit with OK/FAIL, duration, stderr tail|
 | `doctor` / `test`        | Show current config and send a test ping                      |
 | `--help`, `--version`    |                                                               |
 
@@ -66,9 +66,10 @@ On your phone:
 push-to-phone wrap -t "train resnet50" -- python train.py --epochs 100
 ```
 
-Runs the command, measures elapsed time, and pushes a notification when it's done:
-- **Success:** `✅ train resnet50` / `done in 3h 14m 2s`
-- **Failure:** `❌ train resnet50` / `failed (exit 1) in 0m 12s` + last 10 lines of stderr, priority `high`.
+Runs the command, measures elapsed time, and pushes a notification when it's done. The ntfy Tags header still carries a `white_check_mark` or `x` emoji so the notification reads at a glance:
+- **Success:** title `[OK] train resnet50`, body `done in 3h 14m 2s`, tag `white_check_mark`
+- **Failure:** title `[FAIL] train resnet50`, body `failed (exit 1) in 0m 12s` plus last 10 lines of stderr, priority `high`, tag `x`
+- **Cancelled (ctrl-c):** title `[CANCELLED] ...`, tag `warning`, exit code `130`
 
 Wrap sub-flags:
 ```

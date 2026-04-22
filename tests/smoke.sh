@@ -33,33 +33,33 @@ export NTFY_TOPIC="test-topic"
 echo "4) Dry-run single URL composes Click + view action"
 out=$("$BIN" --dry-run -t "title" https://example.com)
 grep -q "Click: https://example.com" <<<"$out" && grep -q "Actions: view," <<<"$out" \
-  && pass "URL → Click+Actions headers" \
-  || fail "URL → Click+Actions headers" "$out"
+  && pass "URL -> Click+Actions headers" \
+  || fail "URL -> Click+Actions headers" "$out"
 
 echo "5) Dry-run with --tag composes Tags header"
 out=$("$BIN" --dry-run --tag rocket,green_circle -m hi)
 grep -q "Tags: rocket,green_circle" <<<"$out" \
-  && pass "--tag → Tags header" || fail "--tag → Tags header" "$out"
+  && pass "--tag -> Tags header" || fail "--tag -> Tags header" "$out"
 
 echo "6) Dry-run with --at composes At header"
 out=$("$BIN" --dry-run --at "tomorrow 9am" -m hi)
 grep -q "At: tomorrow 9am" <<<"$out" \
-  && pass "--at → At header" || fail "--at → At header" "$out"
+  && pass "--at -> At header" || fail "--at -> At header" "$out"
 
 echo "7) Dry-run with --markdown composes Markdown header"
 out=$("$BIN" --dry-run --markdown -m "**hi**")
 grep -q "Markdown: yes" <<<"$out" \
-  && pass "--markdown → Markdown header" || fail "--markdown → Markdown header" "$out"
+  && pass "--markdown -> Markdown header" || fail "--markdown -> Markdown header" "$out"
 
 echo "8) Dry-run with --copy composes Actions: copy"
 out=$("$BIN" --dry-run --copy "secret-123" -m "OTP")
 grep -q "Actions: copy, Copy, secret-123" <<<"$out" \
-  && pass "--copy → Actions header" || fail "--copy → Actions header" "$out"
+  && pass "--copy -> Actions header" || fail "--copy -> Actions header" "$out"
 
 echo "9) --token adds Authorization header"
 out=$("$BIN" --dry-run --token "tk_abc" -m hi)
 grep -q "Authorization: Bearer tk_abc" <<<"$out" \
-  && pass "--token → Authorization header" || fail "--token → Authorization header" "$out"
+  && pass "--token -> Authorization header" || fail "--token -> Authorization header" "$out"
 
 echo "10) wrap runs a successful command and returns its exit code"
 export NTFY_TOPIC="test-topic"
@@ -89,6 +89,40 @@ if grep -q $'\r' <<<"$out"; then fail "newline sanitize" "CR leaked through"
 elif grep -qE '^  header: Injected:' <<<"$out"; then fail "newline sanitize" "LF split into extra header"
 else pass "CRLF stripped from title"
 fi
+
+echo "14a) Multi-line message body passes through without config-parser error"
+# Uses the curl-spy to confirm: (a) a data-binary @file arg is present,
+# (b) the contents of that file exactly match our multi-line message.
+spydir=$(mktemp -d -t spy2.XXXXXX)
+cat > "$spydir/curl" <<'SPY'
+#!/usr/bin/env bash
+# Accept -K <cfg> -o <out> -w <fmt> ; echo 200 on stdout, pass.
+cfg_arg=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -K) cfg_arg="$2"; shift 2 ;;
+    -o) : > "$2"; shift 2 ;;
+    *)  shift ;;
+  esac
+done
+cp "$cfg_arg" "$SPY_CFG_OUT"
+# Find data-binary @file and copy its contents
+datafile=$(sed -n 's/^data-binary = "@\(.*\)"$/\1/p' "$cfg_arg" | head -1)
+[[ -f "$datafile" ]] && cp "$datafile" "$SPY_DATA_OUT"
+echo "200"
+SPY
+chmod +x "$spydir/curl"
+export SPY_CFG_OUT="$spydir/cfg.txt"
+export SPY_DATA_OUT="$spydir/data.txt"
+msg=$'alpha\nbeta with "quotes"\ngamma'
+PATH="$spydir:$PATH" "$BIN" -t "multiline" -m "$msg" >/dev/null || true
+data_got=$(cat "$SPY_DATA_OUT" 2>/dev/null || echo "")
+if [[ "$data_got" == "$msg" ]]; then
+  pass "multi-line body round-trips byte-exact"
+else
+  fail "multi-line body round-trips byte-exact" "expected=$msg got=$data_got"
+fi
+rm -rf "$spydir"; unset SPY_CFG_OUT SPY_DATA_OUT
 
 echo "14) Topic does not appear in curl argv (no argv leak on send)"
 # With the refactor, curl runs as:  curl -K <config> -o <out> -w <fmt>
